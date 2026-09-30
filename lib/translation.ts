@@ -1,4 +1,5 @@
 import { GoogleGenAI } from '@google/genai';
+import type { TranslateMode } from './types';
 
 export type TranslationProvider = 'gemini' | 'libretranslate' | 'openrouter' | 'test';
 
@@ -48,13 +49,23 @@ Return ONLY the Urdu translation.
 Preserve Islamic/Mosque terminology appropriately.
 Do not add commentary, greetings, or extra text.`;
 
+const OPENROUTER_INTERIM_SYSTEM_PROMPT = `Translate the provided Arabic speech fragment into Urdu in real time.
+Requirements:
+- Translate ONLY the words provided.
+- Do NOT attempt to complete the unfinished sentence.
+- Do NOT add polite greetings, punctuation, or commentary.
+- Return ONLY the raw Urdu fragment.`;
+
 export const MOCK_URDU_TRANSLATION = 'یہ ایک فرضی ترجمہ ہے۔ (Mock Translation)';
 
 /**
  * Translates Arabic text to Urdu based on configured TRANSLATION_PROVIDER and TRANSLATION_TEST_MODE.
  * TEST MODE always overrides Gemini, LibreTranslate, and OpenRouter without calling external APIs.
  */
-export async function translateArabicToUrdu(text: string): Promise<TranslationResult> {
+export async function translateArabicToUrdu(
+  text: string,
+  mode: TranslateMode = 'final'
+): Promise<TranslationResult> {
   // TEST MODE: Must ALWAYS override all providers without calling external APIs
   if (process.env.TRANSLATION_TEST_MODE === 'true') {
     console.log('[TRANSLATION] provider=test');
@@ -80,7 +91,7 @@ export async function translateArabicToUrdu(text: string): Promise<TranslationRe
   }
 
   if (provider === 'openrouter') {
-    return translateWithOpenRouter(text);
+    return translateWithOpenRouter(text, mode);
   }
 
   throw new TranslationError('Configuration Error', 400, `Unsupported provider: ${rawProvider}`);
@@ -332,7 +343,10 @@ async function translateWithLibreTranslate(text: string): Promise<TranslationRes
  * OpenRouter translation provider using OpenAI-compatible Chat Completions API.
  * Uses OPENROUTER_URL, OPENROUTER_MODEL, and OPENROUTER_API_KEY.
  */
-export async function translateWithOpenRouter(text: string): Promise<TranslationResult> {
+export async function translateWithOpenRouter(
+  text: string,
+  mode: TranslateMode = 'final'
+): Promise<TranslationResult> {
   const apiKey = process.env.OPENROUTER_API_KEY;
   if (!apiKey || apiKey.trim() === '') {
     console.error('OPENROUTER_API_KEY is missing');
@@ -347,14 +361,19 @@ export async function translateWithOpenRouter(text: string): Promise<Translation
 
   const model = (process.env.OPENROUTER_MODEL || 'google/gemini-2.5-flash').trim();
 
+  const isInterim = mode === 'interim';
+  const systemPrompt = isInterim ? OPENROUTER_INTERIM_SYSTEM_PROMPT : OPENROUTER_SYSTEM_PROMPT;
+  const maxTokens = isInterim ? 60 : 150;
+  const temperature = isInterim ? 0.1 : 0.2;
+
   const requestBody = {
     model,
     messages: [
-      { role: 'system', content: OPENROUTER_SYSTEM_PROMPT },
+      { role: 'system', content: systemPrompt },
       { role: 'user', content: text },
     ],
-    temperature: 0.2,
-    max_tokens: 150,
+    temperature,
+    max_tokens: maxTokens,
   };
 
   console.log('[TRANSLATION] provider=openrouter');

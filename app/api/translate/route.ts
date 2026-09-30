@@ -25,7 +25,17 @@ export async function GET() {
 export async function POST(request: Request) {
   try {
     const body = await request.json();
-    const { text, sourceLanguage, targetLanguage } = body;
+    const { text, sourceLanguage, targetLanguage, mode = 'final' } = body;
+
+    if (mode !== 'interim' && mode !== 'final') {
+      return NextResponse.json(
+        { error: 'Invalid mode' },
+        {
+          status: 400,
+          headers: { 'Cache-Control': 'no-store, no-cache, must-revalidate' },
+        }
+      );
+    }
 
     if (!text || typeof text !== 'string' || text.trim() === '') {
       return NextResponse.json(
@@ -57,7 +67,7 @@ export async function POST(request: Request) {
       );
     }
 
-    const result = await translateArabicToUrdu(text.trim());
+    const result = await translateArabicToUrdu(text.trim(), mode);
     return NextResponse.json(result, {
       headers: { 'Cache-Control': 'no-store, no-cache, must-revalidate' },
     });

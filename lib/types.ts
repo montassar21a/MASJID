@@ -19,6 +19,14 @@ export interface TranslationPair {
   urdu: string;
 }
 
+export type TranslateMode = 'interim' | 'final';
+
+export interface InterimState {
+  arabic: string;
+  urdu: string;
+  isActive: boolean;
+}
+
 export type SpeechRecognitionEventLike = Event & {
   results: {
     [index: number]: {

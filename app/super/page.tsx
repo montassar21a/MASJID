@@ -47,6 +47,12 @@ export default function SuperAdminPage() {
   const [latency, setLatency] = useState<number | null>(null)
   const [errorMessage, setErrorMessage] = useState<string | null>(null)
 
+  // Real-time interim state (Phase 1: Admin only)
+  const [interimArabic, setInterimArabic] = useState<string>('')
+  const [interimUrdu, setInterimUrdu] = useState<string>('')
+  const [isInterimLoading, setIsInterimLoading] = useState<boolean>(false)
+  const [realtimeMode, setRealtimeMode] = useState<boolean>(true)
+
   const retryRef = useRef(0)
   const wsRef = useRef<WebSocket | null>(null)
   const silenceTimerRef = useRef<number | null>(null)
@@ -57,6 +63,17 @@ export default function SuperAdminPage() {
   useEffect(() => {
     isListeningRef.current = isListening
   }, [isListening])
+
+  const realtimeModeRef = useRef(realtimeMode)
+  useEffect(() => {
+    realtimeModeRef.current = realtimeMode
+  }, [realtimeMode])
+
+  const interimAbortRef = useRef<AbortController | null>(null)
+  const interimSeqRef = useRef<number>(0)
+  const interimDebounceRef = useRef<NodeJS.Timeout | null>(null)
+  const lastInterimSentTextRef = useRef<string>('')
+  const isFinalPendingRef = useRef<boolean>(false)
 
   const queueRef = useRef<{ text: string; startMark: number }[]>([])
   const isProcessingQueueRef = useRef(false)
@@ -287,9 +304,117 @@ export default function SuperAdminPage() {
     }
 
     isProcessingQueueRef.current = false
+    isFinalPendingRef.current = false
     if (isListeningRef.current) {
       setSessionState('LISTENING')
     }
+  }
+
+  // Helper functions for real-time interim speech
+  function normalizeArabic(text: string): string {
+    return text
+      .replace(/[\u064B-\u065F\u0670]/g, '')
+      .replace(/[إأآا]/g, 'ا')
+      .replace(/[\s\t\n]+/g, ' ')
+      .trim()
+  }
+
+  function countArabicWords(text: string): number {
+    const norm = normalizeArabic(text)
+    return norm ? norm.split(' ').length : 0
+  }
+
+  async function dispatchInterimTranslation(text: string) {
+    // Abort previous in-flight interim
+    if (interimAbortRef.current) {
+      interimAbortRef.current.abort()
+      interimAbortRef.current = null
+    }
+
+    const controller = new AbortController()
+    interimAbortRef.current = controller
+    const currentSeq = ++interimSeqRef.current
+    setIsInterimLoading(true)
+
+    // 4-second timeout for interim calls
+    const timeoutId = setTimeout(() => controller.abort(), 4000)
+
+    try {
+      const res = await fetch('/api/translate', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Cache-Control': 'no-cache',
+        },
+        body: JSON.stringify({
+          text,
+          sourceLanguage: 'ar',
+          targetLanguage: 'ur',
+          mode: 'interim',
+        }),
+        signal: controller.signal,
+      })
+
+      clearTimeout(timeoutId)
+
+      if (!res.ok) {
+        setIsInterimLoading(false)
+        return
+      }
+
+      const data = await res.json()
+
+      // Sequence guard: ignore if newer interim or final has begun
+      if (
+        currentSeq === interimSeqRef.current &&
+        !isFinalPendingRef.current &&
+        data.translation
+      ) {
+        setInterimUrdu(data.translation)
+      }
+    } catch (err: any) {
+      clearTimeout(timeoutId)
+      // Silent abort handling
+      if (err.name === 'AbortError' || err.message?.includes('aborted')) {
+        return
+      }
+      // Silent network error
+      console.warn('[INTERIM] network error dropped', err)
+    } finally {
+      if (interimAbortRef.current === controller) {
+        interimAbortRef.current = null
+      }
+      setIsInterimLoading(false)
+    }
+  }
+
+  function handleInterimSpeechResult(rawTranscript: string) {
+    if (!realtimeModeRef.current) return
+
+    const normalized = normalizeArabic(rawTranscript)
+    const wordCount = countArabicWords(rawTranscript)
+
+    // Min 3 words gate
+    if (wordCount < 3) {
+      setInterimArabic(rawTranscript)
+      return
+    }
+
+    // Exact match gate
+    if (normalized === lastInterimSentTextRef.current) {
+      return
+    }
+
+    setInterimArabic(rawTranscript)
+
+    // Debounce 450ms
+    if (interimDebounceRef.current) {
+      clearTimeout(interimDebounceRef.current)
+    }
+    interimDebounceRef.current = setTimeout(() => {
+      lastInterimSentTextRef.current = normalized
+      dispatchInterimTranslation(rawTranscript)
+    }, 450)
   }
 
   // 4. Continuous, Self-Healing SpeechRecognition Engine
@@ -320,7 +445,7 @@ export default function SuperAdminPage() {
 
       const recognition = new SpeechRecognition()
       recognition.continuous = true
-      recognition.interimResults = false
+      recognition.interimResults = true
       recognition.lang = 'ar-SA'
 
       recognition.onstart = () => {
@@ -334,11 +459,37 @@ export default function SuperAdminPage() {
         if (isDisposed) return
         const result = event.results[event.resultIndex]?.[0]
         const transcript = result?.transcript?.trim()
+        if (!transcript) return
 
-        if (!transcript || result?.isFinal === false) return
+        // INTERIM (Phase 1)
+        if (result?.isFinal === false) {
+          handleInterimSpeechResult(transcript)
+          return
+        }
+
+        // FINAL
+        isFinalPendingRef.current = true
+
+        // Abort any pending interim
+        if (interimAbortRef.current) {
+          interimAbortRef.current.abort()
+          interimAbortRef.current = null
+        }
+        if (interimDebounceRef.current) {
+          clearTimeout(interimDebounceRef.current)
+          interimDebounceRef.current = null
+        }
+        interimSeqRef.current = -1 // Invalidate all in-flight
+
+        // Clear interim buffers
+        setInterimArabic('')
+        setInterimUrdu('')
+        setIsInterimLoading(false)
+        lastInterimSentTextRef.current = ''
 
         if (transcript === lastTranslatedTextRef.current) {
           console.log('[v0] DUPLICATE SPEECH IGNORED', transcript)
+          isFinalPendingRef.current = false
           return
         }
         lastTranslatedTextRef.current = transcript
@@ -350,6 +501,7 @@ export default function SuperAdminPage() {
       }
 
       recognition.onerror = (event: any) => {
+        if (interimDebounceRef.current) clearTimeout(interimDebounceRef.current)
         if (isDisposed) return
         const err = event.error
 
@@ -401,6 +553,14 @@ export default function SuperAdminPage() {
     return () => {
       isDisposed = true
       if (restartTimeoutRef.current) window.clearTimeout(restartTimeoutRef.current)
+      if (interimAbortRef.current) {
+        interimAbortRef.current.abort()
+        interimAbortRef.current = null
+      }
+      if (interimDebounceRef.current) {
+        clearTimeout(interimDebounceRef.current)
+        interimDebounceRef.current = null
+      }
       if (recognitionInstanceRef.current) {
         try {
           recognitionInstanceRef.current.onend = null
@@ -430,6 +590,19 @@ export default function SuperAdminPage() {
     setIsListening(false)
     isListeningRef.current = false
     if (restartTimeoutRef.current) window.clearTimeout(restartTimeoutRef.current)
+    if (interimAbortRef.current) {
+      interimAbortRef.current.abort()
+      interimAbortRef.current = null
+    }
+    if (interimDebounceRef.current) {
+      clearTimeout(interimDebounceRef.current)
+      interimDebounceRef.current = null
+    }
+    setInterimArabic('')
+    setInterimUrdu('')
+    setIsInterimLoading(false)
+    lastInterimSentTextRef.current = ''
+    isFinalPendingRef.current = false
     if (recognitionInstanceRef.current) {
       try {
         recognitionInstanceRef.current.onend = null
@@ -654,6 +827,59 @@ export default function SuperAdminPage() {
                       </div>
                       <div className="preview-urdu">{current.urdu}</div>
                     </>
+                  ) : (interimArabic || interimUrdu) ? (
+                    <>
+                      <div
+                        style={{
+                          position: 'absolute',
+                          top: '12px',
+                          right: '14px',
+                          display: 'flex',
+                          alignItems: 'center',
+                          gap: '6px',
+                          fontSize: '9px',
+                          fontWeight: 'bold',
+                          color: '#6ee7b7',
+                          background: '#064e3b88',
+                          border: '1px solid #05966955',
+                          padding: '2px 7px',
+                          borderRadius: '4px',
+                          letterSpacing: '0.5px',
+                        }}
+                      >
+                        {isInterimLoading && (
+                          <span
+                            style={{
+                              width: '6px',
+                              height: '6px',
+                              borderRadius: '50%',
+                              background: '#34d399',
+                              display: 'inline-block',
+                            }}
+                          />
+                        )}
+                        DRAFT
+                      </div>
+                      {showArabic && interimArabic && (
+                        <div
+                          className="preview-arabic"
+                          style={{ fontStyle: 'italic', opacity: 0.85, color: '#94a3b8' }}
+                        >
+                          {interimArabic}
+                        </div>
+                      )}
+                      <div className="preview-divider" style={{ opacity: 0.5 }}>
+                        <span />
+                        <i>✦</i>
+                        <span />
+                      </div>
+                      <div
+                        className="preview-urdu"
+                        style={{ color: '#6ee7b7', opacity: 0.85 }}
+                      >
+                        {interimUrdu || '...'}
+                      </div>
+                    </>
                   ) : (
                     <div className="live-waiting-indicator">
                       <span className="live-dot" /> LIVE
@@ -718,6 +944,38 @@ export default function SuperAdminPage() {
                   <span>System Default</span>
                   <ChevronDown size={15} />
                 </div>
+              </div>
+              <div className="setting-block">
+                <div className="setting-label">
+                  <span>Translation mode</span>
+                  <strong className={realtimeMode ? 'green-text' : ''}>
+                    {realtimeMode ? 'Real-Time (Interim)' : 'Standard (Sentence)'}
+                  </strong>
+                </div>
+                <label className="switch-row">
+                  <span>Real-Time Mode (Beta)</span>
+                  <input
+                    type="checkbox"
+                    checked={realtimeMode}
+                    onChange={(e) => {
+                      const enabled = e.target.checked
+                      setRealtimeMode(enabled)
+                      if (!enabled) {
+                        setInterimArabic('')
+                        setInterimUrdu('')
+                        if (interimAbortRef.current) {
+                          interimAbortRef.current.abort()
+                          interimAbortRef.current = null
+                        }
+                        if (interimDebounceRef.current) {
+                          clearTimeout(interimDebounceRef.current)
+                          interimDebounceRef.current = null
+                        }
+                      }
+                    }}
+                  />
+                  <span className="switch" />
+                </label>
               </div>
               <div className="setting-block">
                 <div className="setting-label">
